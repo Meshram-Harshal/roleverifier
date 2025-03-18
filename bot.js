@@ -384,7 +384,7 @@ client.login(DISCORD_TOKEN).catch(error => {
 
 
 const app = express();
-const PORT = 4000;
+const PORT = 5000;
 
 // Basic route
 app.get('/', (req, res) => {
