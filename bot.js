@@ -1,7 +1,10 @@
-const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, Events, AttachmentBuilder } = require('discord.js');
 const { MongoClient } = require('mongodb');
 const express = require('express');
 const axios = require('axios');
+const XLSX = require('xlsx');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 // const communityCoins = require('./communitycoins.js');
 
@@ -465,6 +468,54 @@ async function getCurrentWhaleAddresses() {
   }
 }
 
+// Function to generate Excel file with whale addresses
+async function generateWhaleAddressesExcel() {
+  try {
+    const whaleAddresses = await getCurrentWhaleAddresses();
+    
+    if (whaleAddresses.length === 0) {
+      return null;
+    }
+    
+    // Prepare data for Excel with serial numbers
+    const excelData = whaleAddresses.map((whale, index) => ({
+      'Serial No.': index + 1,
+      'Username': whale.username || 'N/A',
+      'Wallet Address': whale.walletAddress || 'N/A',
+      'Points': whale.points || 0
+    }));
+    
+    // Create workbook and worksheet
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(excelData);
+    
+    // Set column widths for better readability
+    const columnWidths = [
+      { wch: 12 }, // Serial No.
+      { wch: 20 }, // Username
+      { wch: 45 }, // Wallet Address
+      { wch: 15 }  // Points
+    ];
+    worksheet['!cols'] = columnWidths;
+    
+    // Add worksheet to workbook
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Whale Addresses');
+    
+    // Generate timestamp for filename
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+    const filename = `whale_addresses_${timestamp}.xlsx`;
+    const filepath = path.join(__dirname, filename);
+    
+    // Write file
+    XLSX.writeFile(workbook, filepath);
+    
+    return { filepath, filename, count: whaleAddresses.length };
+  } catch (error) {
+    console.error('Error generating whale addresses Excel:', error);
+    return null;
+  }
+}
+
 // Function to perform full sync of current whale role holders with whale_addresses collection
 async function syncAllWhaleRoles() {
   try {
@@ -571,21 +622,48 @@ client.on(Events.MessageCreate, async message => {
     return;
   }
 
-  // Debug command to check current whale addresses (optional - remove if not needed)
-  if (message.content === '!whaleaddresses' && message.member.permissions.has('ADMINISTRATOR')) {
+  // New command to generate and send whale addresses Excel file
+  if (message.content === '!whaleaddresses') {
+    // Check if user is on cooldown
+    if (isUserOnCooldown(message.author.id, 'whaleaddresses')) {
+      const cooldown = getRemainingCooldown(message.author.id, 'whaleaddresses');
+      return message.reply(`This command is on cooldown. Please try again in ${cooldown.minutes} minutes and ${cooldown.seconds} seconds.`);
+    }
+    
+    await message.reply('Generating whale addresses Excel file. This may take a moment...');
+    
+    // Set cooldown for this user
+    setUserCooldown(message.author.id, 'whaleaddresses');
+    
     try {
-      const whaleAddresses = await getCurrentWhaleAddresses();
-      if (whaleAddresses.length === 0) {
-        await message.reply('No whale addresses currently stored.');
-      } else {
-        const whaleList = whaleAddresses.map(whale => 
-          `${whale.username} (${whale.walletAddress}) - ${whale.points} points`
-        ).join('\n');
-        await message.reply(`Current whale addresses (${whaleAddresses.length}):\n\`\`\`${whaleList}\`\`\``);
+      const result = await generateWhaleAddressesExcel();
+      
+      if (!result) {
+        await message.reply('No whale addresses found or there was an error generating the Excel file.');
+        return;
       }
+      
+      // Create Discord attachment
+      const attachment = new AttachmentBuilder(result.filepath, { name: result.filename });
+      
+      await message.reply({
+        content: `Here's the whale addresses Excel file containing ${result.count} entries:`,
+        files: [attachment]
+      });
+      
+      // Clean up the temporary file after sending
+      setTimeout(() => {
+        try {
+          fs.unlinkSync(result.filepath);
+          console.log(`Cleaned up temporary file: ${result.filename}`);
+        } catch (cleanupError) {
+          console.error('Error cleaning up temporary file:', cleanupError);
+        }
+      }, 10000); // Delete after 10 seconds
+      
     } catch (error) {
-      console.error('Error fetching whale addresses:', error);
-      await message.reply('Error fetching whale addresses.');
+      console.error('Error generating whale addresses Excel:', error);
+      await message.reply('There was an error generating the whale addresses Excel file. Please try again later.');
     }
     return;
   }
