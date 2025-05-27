@@ -454,6 +454,65 @@ async function syncUserToWhaleCollection(userId, username, hasWhaleRole) {
   }
 }
 
+// Function to get current whale addresses (utility function for debugging/monitoring)
+async function getCurrentWhaleAddresses() {
+  try {
+    const whaleAddresses = await whaleAddressesCollection.find({}).toArray();
+    return whaleAddresses;
+  } catch (error) {
+    console.error('Error getting current whale addresses:', error);
+    return [];
+  }
+}
+
+// Function to perform full sync of current whale role holders with whale_addresses collection
+async function syncAllWhaleRoles() {
+  try {
+    const guild = client.guilds.cache.get(GUILD_ID);
+    if (!guild) {
+      console.error('Guild not found for whale role sync');
+      return;
+    }
+
+    console.log('Starting full whale role sync...');
+    
+    // Get all current whale role holders
+    const whaleRole = guild.roles.cache.get(WHALE_ROLE_ID);
+    if (!whaleRole) {
+      console.error('Whale role not found');
+      return;
+    }
+
+    const currentWhaleMembers = whaleRole.members;
+    console.log(`Found ${currentWhaleMembers.size} members with whale role`);
+
+    // Get all entries currently in whale_addresses collection
+    const currentWhaleAddresses = await getCurrentWhaleAddresses();
+    const whaleAddressUserIds = new Set(currentWhaleAddresses.map(whale => whale.userId));
+
+    // Add missing whale role holders to collection
+    for (const [userId, member] of currentWhaleMembers) {
+      if (!whaleAddressUserIds.has(userId)) {
+        console.log(`Adding ${member.user.tag} to whale_addresses collection`);
+        await syncUserToWhaleCollection(userId, member.user.username, true);
+      }
+    }
+
+    // Remove users from collection who no longer have whale role
+    const currentWhaleUserIds = new Set(currentWhaleMembers.keys());
+    for (const whaleAddress of currentWhaleAddresses) {
+      if (!currentWhaleUserIds.has(whaleAddress.userId)) {
+        console.log(`Removing ${whaleAddress.username} from whale_addresses collection - no longer has whale role`);
+        await removeWhaleAddress(whaleAddress.userId);
+      }
+    }
+
+    console.log('Completed full whale role sync');
+  } catch (error) {
+    console.error('Error during full whale role sync:', error);
+  }
+}
+
 // Discord bot event handlers
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
