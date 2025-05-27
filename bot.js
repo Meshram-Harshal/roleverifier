@@ -21,6 +21,7 @@ const mongoClient = new MongoClient(process.env.MONGODB_URI);
 let db;
 let leaderboardCollection;
 let verifiedWalletsCollection;
+let whaleAddressesCollection;
 
 // Discord configuration
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -45,11 +46,14 @@ async function connectToDatabase() {
     // Initialize collections - this will create them if they don't exist
     leaderboardCollection = db.collection('leaderboard');
     verifiedWalletsCollection = db.collection('verified_wallets');
+    whaleAddressesCollection = db.collection('whale_addresses');
     
     // Insert a dummy document to ensure collections exist (we'll delete it right after)
     try {
       await leaderboardCollection.insertOne({ temp: true });
       await leaderboardCollection.deleteOne({ temp: true });
+      await whaleAddressesCollection.insertOne({ temp: true });
+      await whaleAddressesCollection.deleteOne({ temp: true });
     } catch (err) {
       // Ignore errors here
     }
@@ -74,6 +78,18 @@ async function connectToDatabase() {
         console.log('Index already exists on leaderboard collection');
       } else {
         console.error('Error creating index on leaderboard:', err);
+      }
+    }
+
+    try {
+      await whaleAddressesCollection.createIndex({ walletAddress: 1 });
+      await whaleAddressesCollection.createIndex({ userId: 1 });
+      console.log('Created indexes on whale_addresses collection');
+    } catch (err) {
+      if (err.code === 86) {
+        console.log('Indexes already exist on whale_addresses collection');
+      } else {
+        console.error('Error creating indexes on whale_addresses:', err);
       }
     }
     
@@ -128,6 +144,57 @@ async function getVerifiedLeaderboardWallets() {
   }
 }
 
+// Function to add whale address to whale_addresses collection
+async function addWhaleAddress(walletAddress, username, userId, leaderboardInfo) {
+  try {
+    const whaleData = {
+      walletAddress: walletAddress.toLowerCase(),
+      username: username,
+      userId: userId,
+      nickname: leaderboardInfo.nickname || '',
+      points: leaderboardInfo.point || 0,
+      addedAt: new Date(),
+      lastUpdated: new Date()
+    };
+
+    // Use upsert to either insert new record or update existing one
+    await whaleAddressesCollection.updateOne(
+      { userId: userId },
+      { $set: whaleData },
+      { upsert: true }
+    );
+
+    console.log(`Added/Updated whale address for ${username}: ${walletAddress}`);
+  } catch (error) {
+    console.error('Error adding whale address:', error);
+  }
+}
+
+// Function to remove whale address from whale_addresses collection
+async function removeWhaleAddress(userId) {
+  try {
+    const result = await whaleAddressesCollection.deleteOne({ userId: userId });
+    if (result.deletedCount > 0) {
+      console.log(`Removed whale address for user ID: ${userId}`);
+    }
+  } catch (error) {
+    console.error('Error removing whale address:', error);
+  }
+}
+
+// Function to get leaderboard info for a wallet address
+async function getLeaderboardInfo(walletAddress) {
+  try {
+    const leaderboardEntry = await leaderboardCollection.findOne({
+      address: { $regex: new RegExp(`^${walletAddress}$`, 'i') }
+    });
+    return leaderboardEntry;
+  } catch (error) {
+    console.error('Error getting leaderboard info:', error);
+    return null;
+  }
+}
+
 // Function to remove whale roles from users who were in the leaderboard
 async function removeLeaderboardRoles() {
   try {
@@ -150,15 +217,17 @@ async function removeLeaderboardRoles() {
     // Get the Discord user IDs for these wallets
     const userIds = verifiedLeaderboardWallets.map(wallet => wallet.userId);
     
-    // Remove roles from these users
+    // Remove roles from these users and remove from whale_addresses collection
     let removedCount = 0;
     for (const userId of userIds) {
       try {
         const member = await guild.members.fetch(userId);
         if (member && member.roles.cache.has(WHALE_ROLE_ID)) {
           await member.roles.remove(WHALE_ROLE_ID);
+          // Remove from whale_addresses collection
+          await removeWhaleAddress(userId);
           removedCount++;
-          console.log(`Removed whale role from ${member.user.tag}`);
+          console.log(`Removed whale role from ${member.user.tag} and removed from whale_addresses`);
         }
       } catch (error) {
         console.error(`Failed to remove role from user ${userId}:`, error.message);
@@ -258,8 +327,24 @@ async function assignRolesToEligibleUsers() {
                 await member.roles.add(WHALE_ROLE_ID);
                 console.log(`Assigned whale role to ${verifiedWallet.username}`);
                 rolesAssigned++;
+                
+                // Add to whale_addresses collection
+                await addWhaleAddress(
+                  wallet.address,
+                  verifiedWallet.username,
+                  verifiedWallet.userId,
+                  wallet
+                );
               } else {
-                console.log(`${verifiedWallet.username} already has whale role, skipping`);
+                console.log(`${verifiedWallet.username} already has whale role, skipping role assignment`);
+                
+                // Still update/add to whale_addresses collection to ensure data is current
+                await addWhaleAddress(
+                  wallet.address,
+                  verifiedWallet.username,
+                  verifiedWallet.userId,
+                  wallet
+                );
               }
             }
           } catch (memberError) {
@@ -317,6 +402,58 @@ function getRemainingCooldown(userId, commandType) {
   return { minutes, seconds };
 }
 
+// Function to handle role changes and sync with whale_addresses collection
+async function handleRoleChange(member, oldRoles, newRoles) {
+  try {
+    const hadWhaleRole = oldRoles.has(WHALE_ROLE_ID);
+    const hasWhaleRole = newRoles.has(WHALE_ROLE_ID);
+    
+    // If role status changed
+    if (hadWhaleRole !== hasWhaleRole) {
+      if (hasWhaleRole) {
+        // User gained whale role - add to whale_addresses if they have verified wallet
+        console.log(`User ${member.user.tag} gained whale role`);
+        await syncUserToWhaleCollection(member.id, member.user.username, true);
+      } else {
+        // User lost whale role - remove from whale_addresses
+        console.log(`User ${member.user.tag} lost whale role`);
+        await removeWhaleAddress(member.id);
+      }
+    }
+  } catch (error) {
+    console.error('Error handling role change:', error);
+  }
+}
+
+// Function to sync a user to whale collection when they gain whale role
+async function syncUserToWhaleCollection(userId, username, hasWhaleRole) {
+  try {
+    if (!hasWhaleRole) return;
+    
+    // Find their verified wallet
+    const verifiedWallet = await verifiedWalletsCollection.findOne({ userId: userId });
+    if (!verifiedWallet) {
+      console.log(`User ${username} has whale role but no verified wallet found`);
+      return;
+    }
+    
+    // Get their leaderboard info
+    const leaderboardInfo = await getLeaderboardInfo(verifiedWallet.walletAddress);
+    if (!leaderboardInfo) {
+      console.log(`User ${username} has whale role but wallet not found in current leaderboard`);
+      // Still add them to whale_addresses with basic info
+      await addWhaleAddress(verifiedWallet.walletAddress, username, userId, { nickname: '', point: 0 });
+      return;
+    }
+    
+    // Add to whale_addresses collection
+    await addWhaleAddress(verifiedWallet.walletAddress, username, userId, leaderboardInfo);
+    
+  } catch (error) {
+    console.error('Error syncing user to whale collection:', error);
+  }
+}
+
 // Discord bot event handlers
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
@@ -327,16 +464,24 @@ client.once(Events.ClientReady, async (c) => {
   // Initialize community coins module
   // await communityCoins.initializeCommunityCoins(mongoClient, client);
   
-  // Set up the 5-minute role check interval
-  const roleCheckInterval = 5 * 60 * 1000; // 5 minutes
+  // Set up the 10-minute role check interval
+  const roleCheckInterval = 10 * 60 * 1000; // 10 minutes
   console.log(`Setting up role check interval every ${roleCheckInterval/1000/60} minutes`);
   
   setInterval(async () => {
     console.log('Running scheduled role check...');
     await assignRolesToEligibleUsers();
+    // Also perform a full sync to ensure whale_addresses collection is accurate
+    await syncAllWhaleRoles();
   }, roleCheckInterval);
   
   console.log('Bot is ready! Anyone can use !updateleaderboard to update the leaderboard');
+  
+  // Perform initial sync of whale roles on startup
+  setTimeout(async () => {
+    console.log('Performing initial whale role sync...');
+    await syncAllWhaleRoles();
+  }, 5000); // Wait 5 seconds after startup
 });
 
 // Command handler for manual updates
@@ -366,10 +511,35 @@ client.on(Events.MessageCreate, async message => {
     }
     return;
   }
+
+  // Debug command to check current whale addresses (optional - remove if not needed)
+  if (message.content === '!whaleaddresses' && message.member.permissions.has('ADMINISTRATOR')) {
+    try {
+      const whaleAddresses = await getCurrentWhaleAddresses();
+      if (whaleAddresses.length === 0) {
+        await message.reply('No whale addresses currently stored.');
+      } else {
+        const whaleList = whaleAddresses.map(whale => 
+          `${whale.username} (${whale.walletAddress}) - ${whale.points} points`
+        ).join('\n');
+        await message.reply(`Current whale addresses (${whaleAddresses.length}):\n\`\`\`${whaleList}\`\`\``);
+      }
+    } catch (error) {
+      console.error('Error fetching whale addresses:', error);
+      await message.reply('Error fetching whale addresses.');
+    }
+    return;
+  }
   
   // // Handle community role commands
   // const handled = await communityCoins.handleCommunityRoleCommands(message, message.content);
   // if (handled) return;
+});
+
+// Handle role updates to sync with whale_addresses collection
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  // Check if whale role changed
+  await handleRoleChange(newMember, oldMember.roles.cache, newMember.roles.cache);
 });
 
 // Error handling for the Discord client
@@ -395,4 +565,3 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on ${PORT}`);
 });
-
