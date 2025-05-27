@@ -36,7 +36,7 @@ const API_ENDPOINT = 'https://testnet-api-server.nad.fun/reward/top';
 
 // Cooldown tracking
 const userCooldowns = new Map();
-const COOLDOWN_TIME = 5 * 60 * 1000; // 5 minutes in milliseconds
+const COOLDOWN_TIME = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 // Initialize MongoDB connection
 async function connectToDatabase() {
